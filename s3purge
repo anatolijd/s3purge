@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+#
+# s3purge.rb
+#
+# Author:: Anatoliy Dobrosyents, Recorded Future, Inc
+# 
+# Sometime you need to delete S3 object names matching some regular expression.
+# With bucket containing hundreds of thousands objects this could be a pain.
+# This script allows to do regexp search in particular subdirectory (object prefix),
+# and run deletion in multiple simultanious threads.
+# Script even can read bucket objects list in multiple threads too (-m),
+# which is extremely useful for huge (millions objects) buckets. In combination with
+# -p option, it allows search many in many directorties simultaniously.
+
+require 'rubygems'
+require 'optparse'
+require 'logger'
+require 'fog'
+require 'thread'
+
+STDOUT.sync = true
+Log = Logger.new(STDOUT)
+
+options = {}
+options[:thread_count] = 4
+options[:log_level] = 'info'
+options[:multi_read] = false
+options[:dry_run] = false
+options[:patterns] = []
+options[:prefix] = []
+options[:provider] = "AWS"
+options[:access_key] = ENV['AWS_ACCESS_KEY_ID']
+options[:secret_key] = ENV['AWS_SECRET_ACCESS_KEY']
+options[:dry_run] = false
+
+parser = OptionParser.new do|opts|
+    opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
+    opts.separator ''
+    opts.separator 'Options:'
+    opts.on('-a', '--access ACCESS', String,
+            'Storage Access Key') {|key| options[:access_key] = key}
+    opts.on('-b', '--bucket BUCKET', String,
+            'Bucket name (required)') {|key| options[:bucket_name] = key}
+    opts.on('-l', '--log-level LEVEL', String,
+            "Log verbosity (default #{options[:log_level]})") {|key| options[:log_level] = key}
+    opts.on('-m', '--multi',
+            'Read objects in multiple threads (deletion is always multi-threaded)') {|key| options[:multi_read] = true}
+    opts.on('-n', '--noop',
+            'Dry-run mode, no actual deletion') {|key| options[:dry_run] = true}
+    opts.on('-p','--prefix PREFIX1,PREFIX2,..', Array,
+            'Limit search to specific prefix only') {|arr| options[:prefix] = arr}
+    opts.on('-s', '--secret SECRET', String,
+            'Storage Secret Key') {|key| options[:secret_key] = key}
+    opts.on('-t', '--threads N', Integer,
+            "Number of simultaneous threads (default #{options[:thread_count]})") do |val|
+                options[:thread_count] = val
+            end
+    opts.on('-f', '--filter regexp1,regexp2,..', Array,
+            'Filter objects that match this pattern (required)') {|arr| options[:patterns] = arr}
+    opts.on('--provider PROVIDER', String,
+            "Storage provider (default #{options[:provider]})") {|key| options[:provider] = key}
+    opts.on('-h', '--help', 'Show this message') do
+            puts opts
+            exit
+    end
+    opts.separator ''
+    opts.separator '    Instead of --access and --secret options, the environment variables AWS_ACCESS_KEY_ID and'
+    opts.separator '      AWS_SECRET_ACCESS_KEY may be used.'
+    opts.separator '    Specify both \'-p\' and \'-m\' to search every prefix in a separate thread,'
+    opts.separator '      it is useful for very large buckets(100k and more). If you skip -p and use -m only,'
+    opts.separator '      then it will use default prefixes (ascii printable chars [33..126]'
+    opts.separator ''
+    opts.separator 'Example:'
+    opts.separator '    #{$PROGRAM_NAME} -b my-bucket -t8 -f \'-800x600\',\'-1024x800.*(jpg|png)\' -l debug -m -n'
+    opts.separator '      to delete all objects that match any of these patterns, '
+end.parse!(ARGV)
+
+case options[:log_level]
+when 'info'
+    Log.level = Logger::INFO
+when 'debug'
+    Log.level = Logger::DEBUG
+when 'warn'
+    Log.level = Logger::WARN
+when 'error'
+    Log.level = Logger::ERROR
+end 
+
+credentials = {
+    :provider => options[:provider],
+    :aws_access_key_id => options[:access_key],
+    :aws_secret_access_key => options[:secret_key],
+}
+
+S3 = Fog::Storage.new(credentials)
+
+def print_queue(q)
+    p = q.dup
+    while !p.empty? do
+        Log.debug "obj: #{p.deq.key.to_s}"
+    end
+end
+
+def get_bucket_objects_multithread(bucket_name, num_threads=4, prefix_arr=[])
+    # For millions of objects - provide list of avalable prefixes,
+    # search objects by prefix, each search in separate thread,
+    # wait all threads to complete, merge result.
+    threads = []
+    queue = Queue.new
+    p_queue = Queue.new
+    semaphore = Mutex.new
+    total_listed = 0
+    if prefix_arr.empty?
+        prefixes = (33..126).map {|k|k.chr}.to_a
+    else
+        prefixes = prefix_arr
+    end
+    prefixes.each {|p| p_queue.enq(p)}
+    Log.info "number of prefixes: #{prefixes.size}"
+    Log.info "prefixes: #{prefixes.inspect}"
+    Log.info "starting #{[num_threads,p_queue.size].min} search threads"
+    [num_threads,p_queue.size].min.times do |count|
+        threads << Thread.new(count) do |c|
+            Thread.current[:name] = "get S3 objects ##{c}"
+            while !p_queue.empty?
+                p = p_queue.deq
+                pc = 0
+                S3.directories.get(bucket_name).files.all(options = {'prefix' => p}).each do |file|
+                    queue.enq(file)
+                    pc += 1
+                end
+                semaphore.synchronize {total_listed += pc}
+                Log.debug "   prefix:#{p}, count:#{pc} , thread:#{c}"
+            end
+        end
+    end
+    threads.each do |t|
+        begin
+            t.join
+        rescue RuntimeError => e
+            Log.error "Failure on thread #{t[:name]}: #{e.message}"
+        end
+    end
+    queue
+end
+
+def get_bucket_objects(bucket_name,prefix_arr=[])
+    queue = Queue.new
+    Log.info "number of prefixes: #{prefix_arr.size}"
+    Log.info "prefixes: #{prefix_arr.inspect}"
+    arr = prefix_arr.empty? ? [nil] : prefix_arr
+
+    arr.each do |p|
+        file_list = S3.directories.get(bucket_name).files.all(options = {'prefix' => p}).each do |file| 
+            queue.enq(file)
+        end
+    end
+    queue
+end
+
+def delete_bucket_objects_multithread(bucket_name, objects_queue, num_threads=4, sane=true)
+    threads = []
+    Log.info "starting #{[num_threads,objects_queue.size].min} deletion threads"
+    [num_threads,objects_queue.size].min.times do |count|
+        threads << Thread.new(count) do |c|
+            Thread.current[:name] = "delete objects ##{c}"
+            while !objects_queue.empty?
+                f = objects_queue.deq
+                f.destroy if f && sane
+                Log.info "#{f.key.to_s} destroyed, #{sane}, th:#{c}"
+            end
+        end
+    end
+    threads.each do |t|
+        begin
+            t.join
+        rescue RuntimeError => e
+            Log.error "Failure on thread #{t[:name]}: #{e.message}"
+        end
+    end
+end
+
+def filter_queue(queue, patterns=[])
+    #tmp_queue = Queue.new
+    res_queue = Queue.new
+    tmp_queue = queue.dup
+    while !tmp_queue.empty?
+        f = tmp_queue.deq
+        patterns.each do |ptrn|
+            res_queue.enq(f) if f.key =~ ptrn
+        end
+    end
+    res_queue
+end
+
+Log.info "Dry-run mode (-n) enabled, won't delete anything." if options[:dry_run]
+Log.info "Bucket name: #{options[:bucket_name]}"
+patterns = options[:patterns].map {|p| /#{p}/} rescue []
+Log.info "Patterns: #{patterns.inspect}"
+Log.warn "Empty pattern specified. nothing will be selected. To select all objects use pattern '.*'" if patterns.empty?
+if options[:multi_read]
+    Log.info "Read multiple threads"
+    queue = get_bucket_objects_multithread(options[:bucket_name], options[:thread_count],options[:prefix])
+else
+    queue = get_bucket_objects(options[:bucket_name],options[:prefix])
+end
+Log.info "total objects: #{queue.size}"
+delete_queue = filter_queue(queue,patterns)
+Log.info "matching pattern: #{delete_queue.size}"
+print_queue(delete_queue) if options[:log_level] == 'debug'
+delete_bucket_objects_multithread(options[:bucket_name],delete_queue,options[:thread_count], !options[:dry_run])
+Log.info "Done"
